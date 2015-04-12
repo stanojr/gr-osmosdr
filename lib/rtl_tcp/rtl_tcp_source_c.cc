@@ -32,6 +32,19 @@
 #include "rtl_tcp_source_c.h"
 
 #include "arg_helpers.h"
+#include <sys/ioctl.h>
+
+/* copied from rtl sdr code */
+typedef struct { /* structure size must be multiple of 2 bytes */
+  char magic[4];
+  uint32_t tuner_type;
+  uint32_t tuner_gain_count;
+} dongle_info_t;
+
+#define USE_SELECT    1  // non-blocking receive on all platforms
+#define USE_RCV_TIMEO 0  // non-blocking receive on all but Cygwin
+
+#define BYTES_PER_SAMPLE  2 // rtl device delivers 8 bit unsigned IQ data
 
 using namespace boost::assign;
 
@@ -58,13 +71,58 @@ rtl_tcp_source_c_sptr make_rtl_tcp_source_c(const std::string &args)
   return gnuradio::get_initial_sptr(new rtl_tcp_source_c(args));
 }
 
+static int is_error( int perr )
+{
+  // Compare error to posix error code; return nonzero if match.
+#if defined(USING_WINSOCK)
+#define ENOPROTOOPT 109
+  // All codes to be checked for must be defined below
+  int werr = WSAGetLastError();
+  switch( werr ) {
+  case WSAETIMEDOUT:
+    return( perr == EAGAIN );
+  case WSAENOPROTOOPT:
+    return( perr == ENOPROTOOPT );
+  default:
+    fprintf(stderr,"rtl_tcp_source_f: unknown error %d WS err %d \n", perr, werr );
+    throw std::runtime_error("internal error");
+  }
+  return 0;
+#else
+  return( perr == errno );
+#endif
+}
+
+
+static void report_error( const char *msg1, const char *msg2 )
+{
+  // Deal with errors, both posix and winsock
+#if defined(USING_WINSOCK)
+  int werr = WSAGetLastError();
+  fprintf(stderr, "%s: winsock error %d\n", msg1, werr );
+#else
+  perror(msg1);
+#endif
+  if( msg2 != NULL )
+    throw std::runtime_error(msg2);
+  return;
+}
+
+static const int MIN_IN = 0;	// mininum number of input streams
+static const int MAX_IN = 0;	// maximum number of input streams
+static const int MIN_OUT = 1;	// minimum number of output streams
+static const int MAX_OUT = 1;	// maximum number of output streams
+
+
 rtl_tcp_source_c::rtl_tcp_source_c(const std::string &args) :
-  gr::hier_block2("rtl_tcp_source_c",
-                 gr::io_signature::make(0, 0, 0),
-                 gr::io_signature::make(1, 1, sizeof (gr_complex))),
+  gr::sync_block("rtl_tcp_source_c",
+                 gr::io_signature::make(MIN_IN, MAX_IN, sizeof (gr_complex)),
+                 gr::io_signature::make(MIN_OUT, MAX_OUT, sizeof (gr_complex))),
   _no_tuner(false),
   _auto_gain(false),
-  _if_gain(0)
+  _if_gain(0),
+  _running(false),
+  _start(true)
 {
   std::string host = "127.0.0.1";
   unsigned short port = 1234;
@@ -107,43 +165,147 @@ rtl_tcp_source_c::rtl_tcp_source_c(const std::string &args) :
   if (payload_size <= 0)
     payload_size = 16384;
 
-  _src = make_rtl_tcp_source_f(sizeof(float), host.c_str(), port, payload_size);
+  int ret = 0;
+#if defined(USING_WINSOCK) // for Windows (with MinGW)
+  // initialize winsock DLL
+  WSADATA wsaData;
+  int iResult = WSAStartup( MAKEWORD(2,2), &wsaData );
+  if( iResult != NO_ERROR ) {
+    report_error( "rtl_tcp_source_f WSAStartup", "can't open socket" );
+  }
+#endif
 
-  if ( _src->get_tuner_type() != RTLSDR_TUNER_UNKNOWN )
+  // Set up the address stucture for the source address and port numbers
+  // Get the source IP address from the host name
+  struct addrinfo *ip_src;      // store the source IP address to use
+  struct addrinfo hints;
+  memset( (void*)&hints, 0, sizeof(hints) );
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_protocol = IPPROTO_TCP;
+  hints.ai_flags = AI_PASSIVE;
+  char port_str[12];
+  sprintf( port_str, "%d", port );
+
+  // FIXME leaks if report_error throws below
+  ret = getaddrinfo( host.c_str(), port_str, &hints, &ip_src );
+  if( ret != 0 )
+    report_error("rtl_tcp_source_f/getaddrinfo",
+                 "can't initialize source socket" );
+
+  // FIXME leaks if report_error throws below
+  d_temp_buff = new unsigned short[payload_size];   // allow it to hold up to payload_size bytes
+
+  // create a lookup table for gr_complex values
+  for (unsigned int i = 0; i <= 0xffff; i++) {
+#ifdef BOOST_LITTLE_ENDIAN
+    _lut.push_back( gr_complex( (float(i & 0xff) - 127.4f) * (1.0f/128.0f),
+                                (float(i >> 8) - 127.4f) * (1.0f/128.0f) ) );
+#else // BOOST_BIG_ENDIAN
+    _lut.push_back( gr_complex( (float(i >> 8) - 127.4f) * (1.0f/128.0f),
+                                (float(i & 0xff) - 127.4f) * (1.0f/128.0f) ) );
+#endif
+  }
+
+  // create socket
+  d_socket = socket(ip_src->ai_family, ip_src->ai_socktype,
+                    ip_src->ai_protocol);
+
+  // Turn on reuse address
+  int opt_val = 1;
+  if(setsockopt(d_socket, SOL_SOCKET, SO_REUSEADDR, (optval_t)&opt_val, sizeof(int)) == -1) {
+    report_error("SO_REUSEADDR","can't set socket option SO_REUSEADDR");
+  }
+
+  // Don't wait when shutting down
+  linger lngr;
+  lngr.l_onoff  = 1;
+  lngr.l_linger = 0;
+  if(setsockopt(d_socket, SOL_SOCKET, SO_LINGER, (optval_t)&lngr, sizeof(linger)) == -1) {
+    if( !is_error(ENOPROTOOPT) ) {  // no SO_LINGER for SOCK_DGRAM on Windows
+      report_error("SO_LINGER","can't set socket option SO_LINGER");
+    }
+  }
+
+#if USE_RCV_TIMEO
+  // Set a timeout on the receive function to not block indefinitely
+  // This value can (and probably should) be changed
+  // Ignored on Cygwin
+#if defined(USING_WINSOCK)
+  DWORD timeout = 1000;  // milliseconds
+#else
+  timeval timeout;
+  timeout.tv_sec = 1;
+  timeout.tv_usec = 0;
+#endif
+  if(setsockopt(d_socket, SOL_SOCKET, SO_RCVTIMEO, (optval_t)&timeout, sizeof(timeout)) == -1) {
+    report_error("SO_RCVTIMEO","can't set socket option SO_RCVTIMEO");
+  }
+#endif // USE_RCV_TIMEO
+
+  while(connect(d_socket, ip_src->ai_addr, ip_src->ai_addrlen) != 0);
+  freeaddrinfo(ip_src);
+
+  int flag = 1;
+  setsockopt(d_socket, IPPROTO_TCP, TCP_NODELAY, (char *)&flag,sizeof(flag));
+
+  dongle_info_t dongle_info;
+  ret = recv(d_socket, (char*)&dongle_info, sizeof(dongle_info), 0);
+  if (sizeof(dongle_info) != ret)
+    fprintf(stderr,"failed to read dongle info\n");
+
+  d_tuner_type = RTLSDR_TUNER_UNKNOWN;
+  d_tuner_gain_count = 0;
+  d_tuner_if_gain_count = 0;
+
+  if (memcmp(dongle_info.magic, "RTL0", 4) == 0)
+  {
+    d_tuner_type = ntohl(dongle_info.tuner_type);
+    d_tuner_gain_count = ntohl(dongle_info.tuner_gain_count);
+    if ( RTLSDR_TUNER_E4000 == d_tuner_type )
+      d_tuner_if_gain_count = 53;
+  }
+
+
+
+  if ( get_tuner_type() != RTLSDR_TUNER_UNKNOWN )
   {
     std::cerr << "The RTL TCP server reports a "
-              << get_tuner_name( _src->get_tuner_type() )
+              << get_tuner_name( get_tuner_type() )
               << " tuner with "
-              << _src->get_tuner_gain_count() << " RF and "
-              << _src->get_tuner_if_gain_count() << " IF gains."
+              << get_tuner_gain_count() << " RF and "
+              << get_tuner_if_gain_count() << " IF gains."
               << std::endl;
   }
 
   set_gain_mode(false); /* enable manual gain mode by default */
 
-  _src->set_direct_sampling(direct_samp);
+  set_direct_sampling(direct_samp);
   if (direct_samp) {
     _no_tuner = true;
   }
 
-  _src->set_offset_tuning(offset_tune);
-
-  /* rtl tcp source provides a stream of interleaved IQ floats */
-  gr::blocks::deinterleave::sptr deinterleave = \
-      gr::blocks::deinterleave::make( sizeof(float) );
-
-  /* block to convert deinterleaved floats to a complex stream */
-  gr::blocks::float_to_complex::sptr f2c = \
-      gr::blocks::float_to_complex::make( 1 );
-
-  connect(_src, 0, deinterleave, 0);
-  connect(deinterleave, 0, f2c, 0); /* I */
-  connect(deinterleave, 1, f2c, 1); /* Q */
-  connect(f2c, 0, self(), 0);
+  set_offset_tuning(offset_tune);
 }
 
 rtl_tcp_source_c::~rtl_tcp_source_c()
 {
+  delete [] d_temp_buff;
+
+  if (d_socket != -1){
+    shutdown(d_socket, SHUT_RDWR);
+#if defined(USING_WINSOCK)
+    closesocket(d_socket);
+#else
+    ::close(d_socket);
+#endif
+    d_socket = -1;
+  }
+
+#if defined(USING_WINSOCK) // for Windows (with MinGW)
+  // free winsock resources
+  WSACleanup();
+#endif
 }
 
 std::string rtl_tcp_source_c::name()
@@ -193,7 +355,7 @@ osmosdr::meta_range_t rtl_tcp_source_c::get_sample_rates( void )
 
 double rtl_tcp_source_c::set_sample_rate( double rate )
 {
-  _src->set_sample_rate( int(rate) );
+  set_sample_rate( int(rate) );
 
   _rate = rate;
 
@@ -214,7 +376,7 @@ osmosdr::freq_range_t rtl_tcp_source_c::get_freq_range( size_t chan )
     return range;
   }
 
-  enum rtlsdr_tuner tuner = _src->get_tuner_type();
+  enum rtlsdr_tuner tuner = get_tuner_type();
 
   if ( tuner == RTLSDR_TUNER_E4000 ) {
     /* there is a (temperature dependent) gap between 1100 to 1250 MHz */
@@ -239,7 +401,7 @@ osmosdr::freq_range_t rtl_tcp_source_c::get_freq_range( size_t chan )
 
 double rtl_tcp_source_c::set_center_freq( double freq, size_t chan )
 {
-  _src->set_freq( int(freq) );
+  set_freq( int(freq) );
 
   _freq = freq;
 
@@ -253,7 +415,7 @@ double rtl_tcp_source_c::get_center_freq( size_t chan )
 
 double rtl_tcp_source_c::set_freq_corr( double ppm, size_t chan )
 {
-  _src->set_freq_corr( int(ppm) );
+  set_freq_corr( int(ppm) );
 
   _corr = ppm;
 
@@ -271,7 +433,7 @@ std::vector<std::string> rtl_tcp_source_c::get_gain_names( size_t chan )
 
   names += "LNA";
 
-  if ( _src->get_tuner_type() == RTLSDR_TUNER_E4000 ) {
+  if ( get_tuner_type() == RTLSDR_TUNER_E4000 ) {
     names += "IF";
   }
 
@@ -301,7 +463,7 @@ osmosdr::gain_range_t rtl_tcp_source_c::get_gain_range( size_t chan )
   const int *ptr = NULL;
   int len = 0;
 
-  switch (_src->get_tuner_type())
+  switch (get_tuner_type())
   {
   case RTLSDR_TUNER_E4000:
     ptr = e4k_gains; len = sizeof(e4k_gains);
@@ -335,7 +497,7 @@ osmosdr::gain_range_t rtl_tcp_source_c::get_gain_range( size_t chan )
 osmosdr::gain_range_t rtl_tcp_source_c::get_gain_range( const std::string & name, size_t chan )
 {
   if ( "IF" == name ) {
-    if ( _src->get_tuner_type() == RTLSDR_TUNER_E4000 ) {
+    if ( get_tuner_type() == RTLSDR_TUNER_E4000 ) {
       return osmosdr::gain_range_t(3, 56, 1);
     } else {
       return osmosdr::gain_range_t();
@@ -347,8 +509,8 @@ osmosdr::gain_range_t rtl_tcp_source_c::get_gain_range( const std::string & name
 
 bool rtl_tcp_source_c::set_gain_mode( bool automatic, size_t chan )
 {
-  _src->set_gain_mode(int(!automatic));
-  _src->set_agc_mode(automatic);
+  set_gain_mode(int(!automatic));
+  set_agc_mode(automatic);
 
   _auto_gain = automatic;
 
@@ -364,7 +526,7 @@ double rtl_tcp_source_c::set_gain( double gain, size_t chan )
 {
   osmosdr::gain_range_t gains = rtl_tcp_source_c::get_gain_range( chan );
 
-  _src->set_gain( int(gains.clip(gain) * 10.0) );
+  set_gain( int(gains.clip(gain) * 10.0) );
 
   _gain = gain;
 
@@ -396,7 +558,7 @@ double rtl_tcp_source_c::get_gain( const std::string & name, size_t chan )
 
 double rtl_tcp_source_c::set_if_gain(double gain, size_t chan)
 {
-  if ( _src->get_tuner_type() != RTLSDR_TUNER_E4000 ) {
+  if ( get_tuner_type() != RTLSDR_TUNER_E4000 ) {
     _if_gain = 0;
     return _if_gain;
   }
@@ -448,7 +610,7 @@ double rtl_tcp_source_c::set_if_gain(double gain, size_t chan)
   std::cerr << " = " << sum << std::endl;
 #endif
   for (unsigned int stage = 1; stage <= gains.size(); stage++) {
-    _src->set_if_gain(stage, int(gains[ stage ] * 10.0));
+    set_if_gain(stage, int(gains[ stage ] * 10.0));
   }
 
   _if_gain = gain;
@@ -472,4 +634,138 @@ std::string rtl_tcp_source_c::set_antenna( const std::string & antenna, size_t c
 std::string rtl_tcp_source_c::get_antenna( size_t chan )
 {
   return "RX";
+}
+
+bool rtl_tcp_source_c::start()
+{
+  _running = true;
+  _start = true;
+
+  return true;
+}
+
+bool rtl_tcp_source_c::stop()
+{
+  _running = false;
+
+  return true;
+}
+
+
+int rtl_tcp_source_c::work (int noutput_items,
+                            gr_vector_const_void_star &input_items,
+                            gr_vector_void_star &output_items)
+{
+  gr_complex *out = (gr_complex *) output_items[0];
+  ssize_t r = 0;
+
+  int receivedbytes = 0;
+/*
+  int bytesleft = noutput_items*BYTES_PER_SAMPLE;
+  int index = 0;
+*/
+
+  if (!_running) {
+    fprintf(stderr, "not running\n");
+    return WORK_DONE;
+  }
+
+/*
+  while(bytesleft > 0) {
+    receivedbytes = recv(d_socket, (char*)&d_temp_buff[index], bytesleft, 0);
+
+    if(receivedbytes == -1 && !is_error(EAGAIN)){
+      fprintf(stderr, "socket error\n");
+      return -1;
+    }
+    bytesleft -= receivedbytes;
+    index += receivedbytes;
+  }
+  r = noutput_items;
+*/
+
+  receivedbytes = recv(d_socket, (char*)d_temp_buff, (noutput_items*BYTES_PER_SAMPLE), 0);
+
+  if(receivedbytes == -1 && !is_error(EAGAIN)){
+    fprintf(stderr, "socket error\n");
+    return -1;
+  }
+
+  r = receivedbytes/BYTES_PER_SAMPLE;
+
+  //fprintf(stderr,"receivedbytes: %d noutput_items: %d r: %d\n",receivedbytes, noutput_items, r);
+
+  for(int i=0; i<r; ++i) {
+    out[i] = _lut[ d_temp_buff[i] ];
+  }
+
+  return r;
+}
+
+#ifdef _WIN32
+#define __attribute__(x)
+#pragma pack(push, 1)
+#endif
+struct command{
+  unsigned char cmd;
+  unsigned int param;
+}__attribute__((packed));
+#ifdef _WIN32
+#pragma pack(pop)
+#endif
+
+
+void rtl_tcp_source_c::set_freq(int freq)
+{
+  struct command cmd = { 0x01, htonl(freq) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_sample_rate(int sample_rate)
+{
+  struct command cmd = { 0x02, htonl(sample_rate) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_gain_mode(int manual)
+{
+  struct command cmd = { 0x03, htonl(manual) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_gain(int gain)
+{
+  struct command cmd = { 0x04, htonl(gain) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_freq_corr(int ppm)
+{
+  struct command cmd = { 0x05, htonl(ppm) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_if_gain(int stage, int gain)
+{
+  uint32_t params = stage << 16 | (gain & 0xffff);
+  struct command cmd = { 0x06, htonl(params) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_agc_mode(int on)
+{
+  struct command cmd = { 0x08, htonl(on) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_direct_sampling(int on)
+{
+  struct command cmd = { 0x09, htonl(on) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
+}
+
+void rtl_tcp_source_c::set_offset_tuning(int on)
+{
+  struct command cmd = { 0x0a, htonl(on) };
+  send(d_socket, (const char*)&cmd, sizeof(cmd), 0);
 }

@@ -21,10 +21,29 @@
 #define RTL_TCP_SOURCE_C_H
 
 #include <gnuradio/hier_block2.h>
+#include <gnuradio/sync_block.h>
 
 #include "source_iface.h"
 
-#include "rtl_tcp_source_f.h"
+#if defined(_WIN32)
+// if not posix, assume winsock
+#pragma comment(lib, "ws2_32.lib")
+#define USING_WINSOCK
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#define SHUT_RDWR 2
+typedef char* optval_t;
+#else
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+typedef void* optval_t;
+#endif
+
+#define ssize_t int
 
 class rtl_tcp_source_c;
 
@@ -32,8 +51,19 @@ typedef boost::shared_ptr< rtl_tcp_source_c > rtl_tcp_source_c_sptr;
 
 rtl_tcp_source_c_sptr make_rtl_tcp_source_c( const std::string & args = "" );
 
+/* copied from rtl sdr */
+enum rtlsdr_tuner {
+  RTLSDR_TUNER_UNKNOWN = 0,
+  RTLSDR_TUNER_E4000,
+  RTLSDR_TUNER_FC0012,
+  RTLSDR_TUNER_FC0013,
+  RTLSDR_TUNER_FC2580,
+  RTLSDR_TUNER_R820T,
+  RTLSDR_TUNER_R828D
+};
+
 class rtl_tcp_source_c :
-    public gr::hier_block2,
+    public gr::sync_block,
     public source_iface
 {
 private:
@@ -45,6 +75,25 @@ public:
   ~rtl_tcp_source_c();
 
   std::string name();
+
+  enum rtlsdr_tuner get_tuner_type() { return (enum rtlsdr_tuner) d_tuner_type; }
+  unsigned int get_tuner_gain_count() { return d_tuner_gain_count; }
+  unsigned int get_tuner_if_gain_count() { return d_tuner_if_gain_count; }
+
+  int work(int noutput_items,
+           gr_vector_const_void_star &input_items,
+           gr_vector_void_star &output_items);
+
+  void set_freq(int freq);
+  void set_sample_rate(int sample_rate);
+  void set_gain_mode(int manual);
+  void set_gain(int gain);
+  void set_freq_corr(int ppm);
+  void set_if_gain(int stage, int gain);
+  void set_agc_mode(int on);
+  void set_direct_sampling(int on);
+  void set_offset_tuning(int on);
+
 
   static std::vector< std::string > get_devices( bool fake = false );
 
@@ -76,12 +125,31 @@ public:
   std::string set_antenna( const std::string & antenna, size_t chan = 0 );
   std::string get_antenna( size_t chan = 0 );
 
+protected:
+  bool start();
+  bool stop();
+
 private:
   double _freq, _rate, _gain, _corr;
   bool _no_tuner;
   bool _auto_gain;
   double _if_gain;
-  rtl_tcp_source_f_sptr _src;
+  bool _running;
+  bool _start;
+
+  size_t        d_itemsize;
+  bool          d_eof;           // zero-length packet is EOF
+  bool          d_wait;          // wait if data if not immediately available
+  int           d_socket;        // handle to socket
+  unsigned short *d_temp_buff;    // hold buffer between calls
+  size_t        d_temp_offset;   // point to temp buffer location offset
+  std::vector<gr_complex> _lut;
+
+  unsigned int d_tuner_type;
+  unsigned int d_tuner_gain_count;
+  unsigned int d_tuner_if_gain_count;
+
+
 };
 
 #endif // RTL_TCP_SOURCE_C_H
